@@ -426,6 +426,87 @@ public:
     });
   }
 
+  [[eosio::action]]
+  void customizedorder(name beneficiary, asset quantity, asset price)
+  {
+    require_auth(CODE_ACCOUNT);
+
+    //validate plan, is_active should be TRUE
+    plan_table p(CODE_ACCOUNT, CODE_ACCOUNT.value);
+    auto idx = p.get_index<"price"_n>();
+    auto plan = idx.find(price.amount);
+    eosio_assert(plan->is_active == TRUE, "plan is in-active");
+    eosio_assert(plan != idx.end(), "invalid price");
+
+    eosio_assert( is_account( beneficiary ), "to account does not exist");
+    eosio_assert( !plan->is_free, "this order should not be free");
+
+    //get active creditor
+    name creditor = get_active_creditor(plan->is_free);
+
+    //plan is not free, make sure creditor has enough balance to delegate
+    asset to_delegate = plan->cpu + plan->net;
+    if(get_balance(creditor) < to_delegate) {
+      creditor = get_qualified_paid_creditor(to_delegate);
+    }
+
+    //make sure creditor is a valid account
+    eosio_assert( is_account( creditor ), "creditor account does not exist");
+
+    //validate beneficiary
+    //1. beneficiary shouldnt be CODE_ACCOUNT
+    //2. beneficiary shouldnt be in blacklist
+    //3. each beneficiary could only have 5 affective orders at most
+    validate_beneficiary(beneficiary, creditor, plan->is_free);
+
+    //INLINE ACTION to delegate CPU&NET for beneficiary account
+    if (is_safe_creditor(creditor)) {
+      INLINE_ACTION_SENDER(safedelegatebw, delegatebw)
+      (creditor, {{creditor, "creditorperm"_n}}, {beneficiary, plan->net, plan->cpu});
+    } else {
+      INLINE_ACTION_SENDER(eosiosystem::system_contract, delegatebw)
+      (EOSIO, {{creditor, "creditorperm"_n}}, {creditor, beneficiary, plan->net, plan->cpu, false});
+    }
+
+    //INLINE ACTION to call check action of `bankofstaked`
+    INLINE_ACTION_SENDER(bankofstaked, check)
+    (CODE_ACCOUNT, {{CODE_ACCOUNT, "bankperm"_n}}, {creditor});
+
+    // add cpu_staked&net_staked to creditor entry
+    creditor_table c(CODE_ACCOUNT, SCOPE);
+    auto creditor_itr = c.find(creditor.value);
+    c.modify(creditor_itr, RAM_PAYER, [&](auto &i) {
+      i.cpu_staked += plan->cpu;
+      i.net_staked += plan->net;
+      i.balance = get_balance(creditor);
+      i.updated_at = now();
+    });
+
+    //create Order entry
+    uint64_t order_id;
+    order_table o(CODE_ACCOUNT, SCOPE);
+    o.emplace(RAM_PAYER, [&](auto &i) {
+      i.id = o.available_primary_key();
+      i.buyer = CODE_ACCOUNT;
+      i.price = quantity;
+      i.creditor = creditor;
+      i.beneficiary = beneficiary;
+      i.plan_id = plan->id;
+      i.cpu_staked = plan->cpu;
+      i.net_staked = plan->net;
+      i.is_free = plan->is_free;
+      i.created_at = now();
+      i.expire_at = now() + plan->duration * SECONDS_PER_MIN;
+
+      order_id = i.id;
+    });
+
+    //deferred transaction to auto undelegate after expired
+    std::vector<uint64_t> order_ids;
+    order_ids.emplace_back(order_id);
+    undelegate(order_ids, plan->duration);
+  }
+
   //token received
   void received_token(name from, name to, asset quantity, string memo)
   {
@@ -657,6 +738,7 @@ extern "C" {
           (activateplan)
           (setrecipient)
           (delrecipient)
+          (customizedorder)
         )
       }
     }
